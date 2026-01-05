@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-КОНВЕРТЕР ZIP -> MD
-Работает с ZIP файлами из папки models
+КОНВЕРТЕР МОДЕЛЕЙ ENGEE -> MD
 """
 
 import os
@@ -10,394 +9,397 @@ import json
 import requests
 import time
 
-# ================= НАСТРОЙКИ =================
-INPUT_FOLDER = "models"                # Папка с ZIP файлами
-OUTPUT_FOLDER = "./mds"                # Куда сохранять .md файлы
-OLLAMA_URL = "http://localhost:11434/api/generate"
-OLLAMA_MODEL = "codellama:13b"            # Или другая модель
+# Конфигурация
+INPUT_FOLDER = "models"
+OUTPUT_FOLDER = "./mds_deepseek"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+MODEL = "deepseek/deepseek-chat"
 
-# Создаем папку для результатов
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-# ================= ПРОМПТ =================
-SYSTEM_PROMPT = """Проанализируй приложенную модель блок-схемы для среды Engee (аналог MATLAB Simulink). 
-Файл модели — это архив (zip) с JSON-файлами, описывающими блоки, параметры и связи. 
-Основная схема находится в файле root.json. Подсистемы, если они есть, находятся в отдельных файлах с хешеподобными именами.
+SYSTEM_PROMPT = """Анализируй модель Engee. Создай техническое описание в Markdown:
 
-Твоя задача — составить краткое техническое описание модели (ТЗ) в формате Markdown. 
-Описание должно быть достаточно подробным, чтобы по нему другой инженер или LLM могли воссоздать эквивалентную модель.
+1. Общее описание модели по именам блоков и сигналов
+2. Параметры симуляции (время, решатель, шаг)
+3. Используемые блоки с ключевыми параметрами
+4. Логическая цепочка работы - как сигналы проходят через блоки
+5. Структура модели и назначение подсистем
 
-Требования к содержанию:
-1. Кратко опиши назначение модели и ее роль в системе (1–3 предложения).
-2. Опиши параметры моделирования, если они есть (тип решателя, шаг интегрирования, время моделирования и т.п.).
-3. Перечисли используемые блоки с ключевыми параметрами:
-    - источники сигналов (тип, имя, основные числовые параметры);
-    - математические/логические блоки (тип, имя, важные коэффициенты, пороги, диапазоны);
-    - приемники (sinks) и их роль.
-4. Опиши логическую цепочку работы схемы:
-    - как формируется входной сигнал(ы);
-    - как он разветвляется и преобразуется;
-    - как вычисляются ключевые выходы;
-    - какие ограничения, насыщения, переключатели используются и по каким условиям.
-5. Опиши структуру модели:
-    - является ли модель плоской или содержит подсистемы;
-    - для каждой подсистемы кратко опиши ее назначение и входы/выходы.
+Формат:
+- Только Markdown
+- Заголовки: "Общее описание", "Параметры симуляции", "Используемые блоки", "Логическая цепочка", "Структура модели"
 
-Требования к формату:
-- Пиши только текст в Markdown, без таблиц и без исходного кода.
-- Структурируй ответ заголовками второго уровня: "Общее описание модели", "Параметры симуляции", "Используемые блоки", "Логическая цепочка", "Структура модели".
-- Не добавляй собственные предположения о физической системе, если это явно не следует из данных модели.
-- Если какой-то информации в модели нет, явно напиши, что она отсутствует.
+Только текст ТЗ в Markdown."""
 
-Выведи только итоговый текст ТЗ в Markdown без дополнительных комментариев."""
+def get_api_key():
+    """Получает API ключ"""
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if api_key:
+        return api_key
+    
+    if os.path.exists(".env"):
+        with open(".env", "r") as f:
+            for line in f:
+                if line.strip().startswith("OPENROUTER_API_KEY="):
+                    return line.split("=", 1)[1].strip()
+    
+    return None
 
-# ================= ФУНКЦИИ =================
-def process_zip_file(zip_path):
-    """Обрабатывает один ZIP файл и возвращает детальную информацию"""
+def analyze_file(zf, filename):
+    """Анализирует файл модели"""
+    try:
+        with zf.open(filename) as f:
+            data = json.load(f)
+        
+        # Ищем объекты
+        objects = None
+        if 'objects' in data:
+            objects = data['objects']
+        elif 'state' in data and 'objects' in data['state']:
+            objects = data['state']['objects']
+        
+        if not objects:
+            return [], []
+        
+        blocks = []
+        lines = []
+        
+        for obj_id, obj in objects.items():
+            if obj.get('type') == 'block':
+                blocks.append({
+                    'id': obj_id[:8],
+                    'name': obj.get('blockName', f'Block_{obj_id[:8]}'),
+                    'type': obj.get('blockType', '')
+                })
+            elif obj.get('type') == 'line':
+                lines.append({
+                    'from': obj.get('source', {}).get('block_id', '')[:8],
+                    'to': obj.get('destination', {}).get('block_id', '')[:8]
+                })
+        
+        return blocks, lines
+        
+    except:
+        return [], []
+
+def extract_model_data(zip_path):
+    """Извлекает данные из ZIP файла"""
     try:
         file_name = os.path.basename(zip_path)
         
         with zipfile.ZipFile(zip_path, 'r') as zf:
-            # Читаем все JSON файлы
-            json_files = {}
-            for json_file in zf.namelist():
-                if json_file.endswith('.json'):
-                    try:
-                        with zf.open(json_file) as f:
-                            json_files[json_file] = json.load(f)
-                    except:
-                        json_files[json_file] = None
+            all_files = zf.namelist()
             
-            # Собираем детальную информацию
             analysis = {
                 'filename': file_name,
-                'json_count': len(json_files),
-                'model_name': 'Неизвестно',
-                'model_type': 'Неизвестно',
+                'model_name': file_name.replace('.zip', '').replace('.engee', ''),
                 'simulation_params': {},
-                'blocks': [],
-                'sources': [],
-                'math_blocks': [],
-                'sinks': [],
+                'root_blocks': [],
+                'root_lines': [],
                 'subsystems': [],
-                'lines': []
+                'total_blocks': 0
             }
             
-            # 1. Извлекаем основную информацию о модели
-            if 'model.json' in json_files and json_files['model.json']:
-                model = json_files['model.json']
-                analysis['model_name'] = model.get('name', 'Неизвестно')
-                analysis['model_type'] = model.get('type', 'Неизвестно')
+            # model.json
+            if 'model.json' in all_files:
+                try:
+                    with zf.open('model.json') as f:
+                        model_data = json.load(f)
+                        name = model_data.get('name', '')
+                        if name:
+                            analysis['model_name'] = name
+                except:
+                    pass
             
-            # 2. Извлекаем параметры симуляции
-            if 'configset.json' in json_files and json_files['configset.json']:
-                config = json_files['configset.json']
-                if 'sets' in config and 'Configuration' in config['sets']:
-                    solver = config['sets']['Configuration'].get('Components', {}).get('Solver', {})
-                    analysis['simulation_params'] = {
-                        'StartTime': solver.get('StartTime'),
-                        'StopTime': solver.get('StopTime'),
-                        'SolverType': solver.get('SolverType'),
-                        'SolverName': solver.get('SolverName'),
-                        'FixedStep': solver.get('FixedStep')
-                    }
-            
-            # 3. Анализируем блоки из root.json
-            if 'root.json' in json_files and json_files['root.json']:
-                root = json_files['root.json']
-                if 'objects' in root:
-                    objects = root['objects']
-                    
-                    # Собираем все блоки
-                    for obj_id, obj in objects.items():
-                        if obj.get('type') == 'block':
-                            block_info = {
-                                'id': obj_id,
-                                'name': obj.get('blockName', f'block_{obj_id[:8]}'),
-                                'type': obj.get('blockType', 'Unknown'),
-                                'path': obj.get('blockPath', ''),
-                                'values': obj.get('blockValues', {})
-                            }
-                            analysis['blocks'].append(block_info)
-                            
-                            # Категоризируем блоки
-                            block_path = block_info['path'].lower()
-                            if 'source' in block_path:
-                                analysis['sources'].append(block_info)
-                            elif 'sink' in block_path:
-                                analysis['sinks'].append(block_info)
-                            elif any(x in block_path for x in ['math', 'operation', 'switch', 'saturation', 'gain', 'logic']):
-                                analysis['math_blocks'].append(block_info)
+            # configset.json
+            if 'configset.json' in all_files:
+                try:
+                    with zf.open('configset.json') as f:
+                        config_data = json.load(f)
                         
-                        elif obj.get('type') == 'line':
-                            line_info = {
-                                'id': obj_id,
-                                'source': obj.get('source', {}),
-                                'destination': obj.get('destination', {}),
-                                'title': obj.get('view', {}).get('line', {}).get('title', '')
-                            }
-                            analysis['lines'].append(line_info)
+                        if isinstance(config_data, dict):
+                            if 'StartTime' in config_data:
+                                analysis['simulation_params'] = {
+                                    'StartTime': config_data.get('StartTime'),
+                                    'StopTime': config_data.get('StopTime'),
+                                    'SolverType': config_data.get('SolverType'),
+                                    'FixedStep': config_data.get('FixedStep')
+                                }
+                            elif 'sets' in config_data:
+                                for set_name, set_data in config_data['sets'].items():
+                                    if isinstance(set_data, dict) and 'Components' in set_data:
+                                        solver = set_data['Components'].get('Solver', {})
+                                        if solver:
+                                            analysis['simulation_params'] = {
+                                                'StartTime': solver.get('StartTime'),
+                                                'StopTime': solver.get('StopTime'),
+                                                'SolverType': solver.get('SolverType'),
+                                                'FixedStep': solver.get('FixedStep')
+                                            }
+                                            break
+                except:
+                    pass
             
-            # 4. Ищем подсистемы
-            for json_file, content in json_files.items():
-                if (json_file not in ['model.json', 'root.json', 'configset.json', 'storage.json', 'callbacks.json'] and 
-                    content and isinstance(content, dict) and 'objects' in content):
-                    # Это похоже на подсистему
-                    analysis['subsystems'].append(json_file)
+            # root.json
+            if 'root.json' in all_files:
+                blocks, lines = analyze_file(zf, 'root.json')
+                analysis['root_blocks'] = blocks
+                analysis['root_lines'] = lines
+                analysis['total_blocks'] += len(blocks)
             
-            return {
-                'success': True,
-                'analysis': analysis,
-                'error': None
-            }
+            # Подсистемы
+            for file in all_files:
+                if (file.endswith('.json') and 
+                    file not in ['model.json', 'configset.json', 'root.json'] and
+                    'model_inference' not in file):
+                    
+                    blocks, lines = analyze_file(zf, file)
+                    
+                    if blocks:
+                        analysis['subsystems'].append({
+                            'filename': file,
+                            'blocks': blocks[:20],
+                            'lines': lines[:20],
+                            'block_count': len(blocks)
+                        })
+                        analysis['total_blocks'] += len(blocks)
+            
+            return True, analysis, ""
             
     except Exception as e:
-        return {
-            'success': False,
-            'analysis': None,
-            'error': str(e)
-        }
+        return False, {}, f"Ошибка: {str(e)}"
 
-def prepare_prompt_from_analysis(analysis):
-    """Подготавливает данные для промпта на основе анализа"""
+def prepare_data_for_prompt(analysis):
+    """Готовит данные для промпта"""
     parts = []
     
-    # Основная информация
-    parts.append(f"Имя файла модели: {analysis['filename']}")
-    parts.append(f"Имя модели: {analysis['model_name']}")
-    parts.append(f"Тип модели: {analysis['model_type']}")
-    parts.append(f"Всего JSON файлов: {analysis['json_count']}")
+    parts.append(f"Модель: {analysis['model_name']}")
+    parts.append(f"Файл: {analysis['filename']}")
     
-    # Параметры симуляции
-    parts.append("\nПАРАМЕТРЫ СИМУЛЯЦИИ:")
+    parts.append("\nПараметры симуляции:")
     if analysis['simulation_params']:
         for key, value in analysis['simulation_params'].items():
-            if value:
-                parts.append(f"  {key}: {value}")
+            if value is not None:
+                parts.append(f"{key}: {value}")
     else:
-        parts.append("  Не указаны в файле модели")
+        parts.append("Не заданы")
     
-    # Источники сигналов
-    parts.append(f"\nИСТОЧНИКИ СИГНАЛОВ ({len(analysis['sources'])}):")
-    for source in analysis['sources'][:10]:
-        params = []
-        for key, value in source['values'].items():
-            if isinstance(value, (str, int, float)) and str(value).strip():
-                params.append(f"{key}={value}")
-        param_str = f" ({', '.join(params)})" if params else ""
-        parts.append(f"  • {source['name']} ({source['type']}){param_str}")
+    parts.append(f"\nСтатистика:")
+    parts.append(f"Всего блоков: {analysis['total_blocks']}")
+    parts.append(f"Подсистем: {len(analysis['subsystems'])}")
     
-    # Математические блоки
-    parts.append(f"\nМАТЕМАТИЧЕСКИЕ/ЛОГИЧЕСКИЕ БЛОКИ ({len(analysis['math_blocks'])}):")
-    for block in analysis['math_blocks'][:15]:  # Ограничиваем 15 блоками
-        params = []
-        for key, value in block['values'].items():
-            if isinstance(value, (str, int, float)) and str(value).strip():
-                params.append(f"{key}={value}")
-        param_str = f" ({', '.join(params[:3])})" if params else ""  # Первые 3 параметра
-        parts.append(f"  • {block['name']} ({block['type']}){param_str}")
-    
-    # Приемники
-    parts.append(f"\nПРИЕМНИКИ (SINKS) ({len(analysis['sinks'])}):")
-    for sink in analysis['sinks'][:10]:
-        parts.append(f"  • {sink['name']} ({sink['type']})")
+    # Блоки в root.json
+    if analysis['root_blocks']:
+        parts.append(f"\nБлоки в основной схеме:")
+        for block in analysis['root_blocks'][:10]:
+            parts.append(f"- {block['name']} ({block['type']})")
     
     # Подсистемы
-    parts.append(f"\nПОДСИСТЕМЫ ({len(analysis['subsystems'])}):")
     if analysis['subsystems']:
-        for i, subsystem in enumerate(analysis['subsystems'][:10], 1):
-            parts.append(f"  {i}. {subsystem}")
-        if len(analysis['subsystems']) > 10:
-            parts.append(f"  ... и еще {len(analysis['subsystems']) - 10} подсистем")
-    else:
-        parts.append("  Подсистемы не обнаружены (плоская модель)")
-    
-    # Статистика связей
-    parts.append(f"\nСТАТИСТИКА:")
-    parts.append(f"  Всего блоков: {len(analysis['blocks'])}")
-    parts.append(f"  Всего связей: {len(analysis['lines'])}")
+        parts.append(f"\nПодсистемы:")
+        for subsystem in analysis['subsystems']:
+            parts.append(f"\n{subsystem['filename']}:")
+            parts.append(f"  Блоков: {subsystem['block_count']}")
+            
+            if subsystem['blocks']:
+                parts.append(f"  Примеры блоков:")
+                for block in subsystem['blocks'][:3]:
+                    parts.append(f"  - {block['name']} ({block['type']})")
     
     return "\n".join(parts)
 
-def ask_ollama(prompt_text):
-    """Запрос к локальной модели"""
+def ask_ai(api_key, prompt_text):
+    """Отправляет запрос к ИИ"""
     try:
-        response = requests.post(
-            OLLAMA_URL,
-            json={
-                "model": OLLAMA_MODEL,
-                "prompt": prompt_text,
-                "stream": False,
-                "options": {
-                    "temperature": 0.1,
-                    "num_predict": 5000
-                }
-            },
-            timeout=120  # 2 минуты
-        )
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "model": MODEL,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt_text}
+            ],
+            "temperature": 0.1,
+            "max_tokens": 2000
+        }
+        
+        response = requests.post(OPENROUTER_URL, json=payload, headers=headers, timeout=60)
         
         if response.status_code == 200:
-            return response.json().get("response", "")
-        else:
-            return f"Ошибка API: {response.status_code}"
+            result = response.json()
+            if 'choices' in result and len(result['choices']) > 0:
+                return True, result['choices'][0]['message']['content'], ""
+        
+        return False, "", f"Ошибка API: {response.status_code}"
             
-    except requests.exceptions.ConnectionError:
-        return "Ошибка: Не могу подключиться к Ollama. Запустите: ollama serve"
     except Exception as e:
-        return f"Ошибка: {str(e)}"
+        return False, "", f"Ошибка: {str(e)}"
 
-def save_md(zip_name, content):
-    """Сохраняет MD файл"""
-    # Берем только имя файла без пути
-    base_name = os.path.basename(zip_name)
-    md_name = base_name.replace('.zip', '.md').replace('.ZIP', '.md')
-    if not md_name.endswith('.md'):
-        md_name += '.md'
+def save_md(zip_filename, content):
+    """Сохраняет Markdown файл"""
+    base_name = os.path.basename(zip_filename)
+    if base_name.lower().endswith('.zip'):
+        md_name = base_name[:-4] + '.md'
+    else:
+        md_name = base_name + '.md'
     
     output_path = os.path.join(OUTPUT_FOLDER, md_name)
     
-    with open(output_path, 'w', encoding='utf-8', errors='ignore') as f:
+    with open(output_path, 'w', encoding='utf-8') as f:
         f.write(content)
     
     return output_path
 
-# ================= ОСНОВНАЯ ЧАСТЬ =================
-print("=" * 70)
-print("КОНВЕРТЕР ZIP -> MD")
-print("=" * 70)
-
-# Проверяем Ollama
-try:
-    test = requests.get("http://localhost:11434/api/tags", timeout=5)
-    if test.status_code == 200:
-        print(f" Ollama доступен, модель: {OLLAMA_MODEL}")
-        use_ai = True
-    else:
-        print(f"  Ollama отвечает с ошибкой {test.status_code}")
-        use_ai = False
-except:
-    print("✗ Ollama недоступен. Будут созданы только сырые данные.")
-    use_ai = False
-
-# Проверяем папку models
-if not os.path.exists(INPUT_FOLDER):
-    print(f"\n Папка '{INPUT_FOLDER}' не существует!")
-    print("Создайте папку 'models' и положите туда ZIP файлы")
-    exit(1)
-
-# Ищем ZIP файлы
-zip_files = [f for f in os.listdir(INPUT_FOLDER) 
-            if f.lower().endswith(('.zip', '.engee'))]
-
-if not zip_files:
-    print(f"\n Нет ZIP файлов в папке '{INPUT_FOLDER}'!")
-    exit(1)
-
-print(f"\nНайдено файлов: {len(zip_files)}")
-
-# Обрабатываем каждый файл
-success_count = 0
-errors = 0
-
-for i, zip_file in enumerate(zip_files, 1):
-    print(f"\n[{i}/{len(zip_files)}] Обрабатываю: {zip_file}")
+def main():
+    print("=" * 60)
+    print("АНАЛИЗ МОДЕЛЕЙ ENGEE")
+    print("=" * 60)
     
-    full_path = os.path.join(INPUT_FOLDER, zip_file)
+    api_key = get_api_key()
+    if not api_key:
+        print("Требуется API ключ")
+        return
     
-    # 1. Анализируем ZIP файл
-    result = process_zip_file(full_path)
+    print(f"Модель ИИ: {MODEL}")
+    print(f"Папка с моделями: {INPUT_FOLDER}")
     
-    if not result['success']:
-        print(f"   Ошибка анализа: {result['error']}")
-        error_content = f"# Ошибка обработки файла: {zip_file}\n\n**Ошибка:** {result['error']}"
-        save_md(zip_file, error_content)
-        errors += 1
-        continue
+    if not os.path.exists(INPUT_FOLDER):
+        print(f"Папка '{INPUT_FOLDER}' не существует!")
+        return
     
-    analysis = result['analysis']
-    print(f"  ✓ Блоков: {len(analysis['blocks'])}, Связей: {len(analysis['lines'])}")
+    zip_files = sorted([f for f in os.listdir(INPUT_FOLDER) 
+                       if f.lower().endswith(('.zip', '.engee'))])
     
-    # 2. Подготавливаем данные для промпта
-    model_data = prepare_prompt_from_analysis(analysis)
+    if not zip_files:
+        print("Нет файлов моделей!")
+        return
     
-    # 3. Формируем финальный промпт
-    final_prompt = f"{SYSTEM_PROMPT}\n\n---\n\nДАННЫЕ МОДЕЛИ:\n\n{model_data}\n\n---\n\nНАЧИНАЙ ВЫВОД СРАЗУ С ЗАГОЛОВКА 'Общее описание модели':"
+    # Проверяем обработанные файлы
+    processed = set()
+    for file in os.listdir(OUTPUT_FOLDER):
+        if file.endswith('.md'):
+            zip_name = file[:-3] + '.zip'
+            if zip_name in zip_files:
+                processed.add(zip_name)
     
-    # 4. Получаем описание от ИИ
-    if use_ai:
-        print("  Генерирую описание с помощью ИИ...")
-        description = ask_ollama(final_prompt)
+    files_to_process = [f for f in zip_files if f not in processed]
+    
+    print(f"\nВсего моделей: {len(zip_files)}")
+    print(f"Уже обработано: {len(processed)}")
+    print(f"Осталось: {len(files_to_process)}")
+    
+    if not files_to_process:
+        print("Все модели уже обработаны!")
+        return
+    
+    processed_count = 0
+    error_count = 0
+    
+    for i, zip_file in enumerate(files_to_process, 1):
+        print(f"\n[{i}/{len(files_to_process)}] {zip_file}")
         
-        # Проверяем на ошибки
-        if "Ошибка" in description or "ошибка" in description.lower():
-            print(f"  Проблема с ИИ: {description[:80]}...")
-            # Используем сырые данные
-            description = f"# Модель: {analysis['model_name']}\n\n## Общее описание модели\n\nНе удалось сгенерировать описание с помощью ИИ.\n\n## Данные модели:\n\n```\n{model_data}\n```"
-    else:
-        print("  Создаю сырое описание...")
-        description = f"# Модель: {analysis['model_name']}\n\n## Общее описание модели\n\nОбработка через ИИ недоступна.\n\n## Данные модели:\n\n```\n{model_data}\n```"
-    
-    # 5. Добавляем метаданные
-    final_content = f"""# Техническое описание модели
+        full_path = os.path.join(INPUT_FOLDER, zip_file)
+        
+        try:
+            success, analysis, error = extract_model_data(full_path)
+        except Exception as e:
+            print(f"  Ошибка извлечения: {e}")
+            error_count += 1
+            continue
+        
+        if not success:
+            print(f"  Ошибка: {error}")
+            error_count += 1
+            continue
+        
+        print(f"  Блоков: {analysis['total_blocks']}")
+        print(f"  Подсистем: {len(analysis['subsystems'])}")
+        
+        # Готовим данные для ИИ
+        model_data = prepare_data_for_prompt(analysis)
+        
+        # Отправляем запрос
+        ai_success, ai_description, ai_error = ask_ai(api_key, model_data)
+        
+        # Создаем документ
+        if ai_success:
+            content = f"""# Техническое описание модели Engee
 
-**Исходный файл:** `{zip_file}`
-**Имя модели:** {analysis['model_name']}
-**Дата генерации:** {time.strftime('%Y-%m-%d %H:%M:%S')}
-**Модель ИИ:** {OLLAMA_MODEL if use_ai else 'Не использовалась'}
+**Файл:** {zip_file}
+**Модель:** {analysis['model_name']}
+**Дата:** {time.strftime('%Y-%m-%d %H:%M:%S')}
 
 ---
 
-{description}
+{ai_description}
+
+---
+
+*Сгенерировано автоматически.*
 """
-    
-    # 6. Сохраняем
-    try:
-        md_path = save_md(zip_file, final_content)
-        print(f"  ✓ Сохранено: {os.path.basename(md_path)}")
-        success_count += 1
-    except Exception as e:
-        print(f" Ошибка сохранения: {e}")
-        errors += 1
-    
-    # Пауза между файлами
-    if i < len(zip_files):
-        time.sleep(1)
-
-print("\n" + "=" * 70)
-print("ОБРАБОТКА ЗАВЕРШЕНА!")
-print("=" * 70)
-print(f"Всего файлов: {len(zip_files)}")
-print(f"Успешно обработано: {success_count}")
-print(f"С ошибками: {errors}")
-print(f"\nРезультаты сохранены в: {os.path.abspath(OUTPUT_FOLDER)}")
-
-# Создаем индексный файл
-index_path = os.path.join(OUTPUT_FOLDER, "INDEX.md")
-with open(index_path, 'w', encoding='utf-8') as f:
-    f.write(f"""# Индекс обработанных моделей
-
-Дата обработки: {time.strftime('%Y-%m-%d %H:%M:%S')}
-Всего моделей: {len(zip_files)}
-Успешно: {success_count}
-С ошибками: {errors}
-Модель ИИ: {OLLAMA_MODEL if use_ai else 'Не использовалась'}
-
-## Список файлов:
-
-""")
-    
-    for zip_file in sorted(zip_files):
-        md_name = zip_file.replace('.zip', '.md').replace('.ZIP', '.md')
-        if not md_name.endswith('.md'):
-            md_name += '.md'
-        
-        if os.path.exists(os.path.join(OUTPUT_FOLDER, md_name)):
-            f.write(f" [{zip_file}]({md_name})\n")
         else:
-            f.write(f" {zip_file}\n")
+            content = f"""# Техническое описание модели Engee
 
-print(f"\nСоздан индексный файл: INDEX.md")
-print("\n" + "=" * 70)
+**Файл:** {zip_file}
+**Модель:** {analysis['model_name']}
+**Дата:** {time.strftime('%Y-%m-%d %H:%M:%S')}
+**Ошибка:** {ai_error}
 
-if os.name == 'nt':
-    input("\nНажмите Enter для выхода...")
+## Параметры симуляции"""
+            
+            if analysis['simulation_params']:
+                for key, value in analysis['simulation_params'].items():
+                    if value is not None:
+                        content += f"\n- **{key}:** {value}"
+            
+            content += f"""
+
+## Статистика
+- Всего блоков: {analysis['total_blocks']}
+- Подсистем: {len(analysis['subsystems'])}"""
+            
+            if analysis['root_blocks']:
+                content += f"\n\n## Блоки в основной схеме"
+                for block in analysis['root_blocks'][:10]:
+                    content += f"\n- {block['name']} ({block['type']})"
+            
+            if analysis['subsystems']:
+                content += f"\n\n## Подсистемы"
+                for subsystem in analysis['subsystems']:
+                    content += f"\n\n### {subsystem['filename']}"
+                    content += f"\n- Блоков: {subsystem['block_count']}"
+                    if subsystem['blocks']:
+                        for block in subsystem['blocks'][:5]:
+                            content += f"\n- {block['name']} ({block['type']})"
+        
+        # Сохраняем
+        try:
+            save_md(zip_file, content)
+            print(f"  Сохранено")
+            processed_count += 1
+        except Exception as e:
+            print(f"  Ошибка сохранения: {e}")
+            error_count += 1
+        
+        # Пауза
+        if i < len(files_to_process):
+            time.sleep(2)
+    
+    print(f"\n" + "=" * 60)
+    print(f"ОБРАБОТКА ЗАВЕРШЕНА")
+    print(f"=" * 60)
+    print(f"Обработано: {processed_count}")
+    print(f"Ошибок: {error_count}")
+    print(f"Всего: {len(processed) + processed_count}/{len(zip_files)}")
+    print(f"\nРезультаты в: {os.path.abspath(OUTPUT_FOLDER)}")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nПрервано")
+    except Exception as e:
+        print(f"Ошибка: {e}")
