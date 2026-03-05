@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 КОНВЕРТЕР МОДЕЛЕЙ ENGEE -> MD
 """
@@ -20,14 +19,13 @@ os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 SYSTEM_PROMPT = """Анализируй модель Engee. Создай техническое описание в Markdown:
 
 1. Общее описание модели по именам блоков и сигналов
-2. Параметры симуляции (время, решатель, шаг)
-3. Используемые блоки с ключевыми параметрами
-4. Логическая цепочка работы - как сигналы проходят через блоки
-5. Структура модели и назначение подсистем
+2. Используемые блоки с ключевыми параметрами
+3. Логическая цепочка работы - как сигналы проходят через блоки
+4. Структура модели и назначение подсистем
 
 Формат:
 - Только Markdown
-- Заголовки: "Общее описание", "Параметры симуляции", "Используемые блоки", "Логическая цепочка", "Структура модели"
+- Заголовки: "Общее описание", "Используемые блоки", "Логическая цепочка", "Структура модели"
 
 Только текст ТЗ в Markdown."""
 
@@ -93,7 +91,6 @@ def extract_model_data(zip_path):
             analysis = {
                 'filename': file_name,
                 'model_name': file_name.replace('.zip', '').replace('.engee', ''),
-                'simulation_params': {},
                 'root_blocks': [],
                 'root_lines': [],
                 'subsystems': [],
@@ -108,35 +105,6 @@ def extract_model_data(zip_path):
                         name = model_data.get('name', '')
                         if name:
                             analysis['model_name'] = name
-                except:
-                    pass
-            
-            # configset.json
-            if 'configset.json' in all_files:
-                try:
-                    with zf.open('configset.json') as f:
-                        config_data = json.load(f)
-                        
-                        if isinstance(config_data, dict):
-                            if 'StartTime' in config_data:
-                                analysis['simulation_params'] = {
-                                    'StartTime': config_data.get('StartTime'),
-                                    'StopTime': config_data.get('StopTime'),
-                                    'SolverType': config_data.get('SolverType'),
-                                    'FixedStep': config_data.get('FixedStep')
-                                }
-                            elif 'sets' in config_data:
-                                for set_name, set_data in config_data['sets'].items():
-                                    if isinstance(set_data, dict) and 'Components' in set_data:
-                                        solver = set_data['Components'].get('Solver', {})
-                                        if solver:
-                                            analysis['simulation_params'] = {
-                                                'StartTime': solver.get('StartTime'),
-                                                'StopTime': solver.get('StopTime'),
-                                                'SolverType': solver.get('SolverType'),
-                                                'FixedStep': solver.get('FixedStep')
-                                            }
-                                            break
                 except:
                     pass
             
@@ -175,14 +143,6 @@ def prepare_data_for_prompt(analysis):
     
     parts.append(f"Модель: {analysis['model_name']}")
     parts.append(f"Файл: {analysis['filename']}")
-    
-    parts.append("\nПараметры симуляции:")
-    if analysis['simulation_params']:
-        for key, value in analysis['simulation_params'].items():
-            if value is not None:
-                parts.append(f"{key}: {value}")
-    else:
-        parts.append("Не заданы")
     
     parts.append(f"\nСтатистика:")
     parts.append(f"Всего блоков: {analysis['total_blocks']}")
@@ -347,15 +307,6 @@ def main():
 **Модель:** {analysis['model_name']}
 **Дата:** {time.strftime('%Y-%m-%d %H:%M:%S')}
 **Ошибка:** {ai_error}
-
-## Параметры симуляции"""
-            
-            if analysis['simulation_params']:
-                for key, value in analysis['simulation_params'].items():
-                    if value is not None:
-                        content += f"\n- **{key}:** {value}"
-            
-            content += f"""
 
 ## Статистика
 - Всего блоков: {analysis['total_blocks']}
